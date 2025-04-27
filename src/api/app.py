@@ -1,26 +1,14 @@
-"""
-FastAPI application for LangManus.
-"""
-
-import json
 import logging
-from typing import Dict, List, Any, Optional, Union
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
-import asyncio
-from typing import AsyncGenerator, Dict, List, Any
-
 from src.graph import build_graph
-from src.config import TEAM_MEMBERS
-from src.service.workflow_service import run_agent_workflow
+from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import json
+import re
 
-# Configure logging
 logger = logging.getLogger(__name__)
+graph = build_graph()
 
-# Create FastAPI app
 app = FastAPI(
     title="LangManus API",
     description="API for LangManus LangGraph-based agent workflow",
@@ -36,100 +24,68 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Create the graph
-graph = build_graph()
+def clean_response(text: str) -> str:
+    """Clean the response format from the agent's messages."""
+    # Remove the "Response from agent:" prefix
+    text = re.sub(r'^Response from [^:]+:\s*', '', text)
+    # Remove the <response> tags and the "Please execute the next step" instruction
+    text = re.sub(r'<response>(.*?)</response>\s*\*Please execute the next step\.\*', r'\1', text, flags=re.DOTALL)
+    return text.strip()
 
+async def stream_workflow_response(user_messages: list,
+                                   deep_thinking: bool = False,
+                                   search_before_planning: bool = False):
 
-class ContentItem(BaseModel):
-    type: str = Field(..., description="The type of content (text, image, etc.)")
-    text: Optional[str] = Field(None, description="The text content if type is 'text'")
-    image_url: Optional[str] = Field(
-        None, description="The image URL if type is 'image'"
+    target_nodes = {"researcher", "coder", "browser",
+                    "planner", "coordinator", "reporter", "supervisor"}
+
+    async for delta in graph.astream(
+        {
+            "TEAM_MEMBERS": list(target_nodes),
+            "messages": user_messages,
+            "deep_thinking_mode": deep_thinking,
+            "search_before_planning": search_before_planning,
+        },
+        stream_mode="updates",
+    ):
+        # Skip if delta is empty
+        if not delta:
+            continue
+            
+        node, patch = next(iter(delta.items()))          # one node finished
+        
+        # Skip if patch is None or doesn't contain messages
+        if not patch or "messages" not in patch:
+            continue                                      # nothing to show
+
+        final_msg = patch["messages"][-1].content
+
+        # Special-case the planner so the front-end can render the workflow UI
+        if node == "planner":
+            payload = {
+                "node": "planner",
+                "kind": "plan",
+                "raw":   final_msg           # JSON string your planner wrote
+            }
+        else:
+            payload = {
+                "node": node,                # e.g. researcher / coordinator
+                "kind": "message",
+                "text": clean_response(final_msg)
+            }
+
+        #  send **JSON** so the client can just `JSON.parse()`
+        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+@app.post("/api/chat")
+async def run_workflow(request: Request):
+    body = await request.json()            # <-- read JSON once
+    return StreamingResponse(
+        stream_workflow_response(
+            body["messages"],
+            deep_thinking=body.get("deep_thinking_mode", False),
+            search_before_planning=body.get("search_before_planning", False),
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
     )
-
-
-class ChatMessage(BaseModel):
-    role: str = Field(
-        ..., description="The role of the message sender (user or assistant)"
-    )
-    content: Union[str, List[ContentItem]] = Field(
-        ...,
-        description="The content of the message, either a string or a list of content items",
-    )
-
-
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage] = Field(..., description="The conversation history")
-    debug: Optional[bool] = Field(False, description="Whether to enable debug logging")
-    deep_thinking_mode: Optional[bool] = Field(
-        False, description="Whether to enable deep thinking mode"
-    )
-    search_before_planning: Optional[bool] = Field(
-        False, description="Whether to search before planning"
-    )
-
-
-@app.post("/api/chat/stream")
-async def chat_endpoint(request: ChatRequest, req: Request):
-    """
-    Chat endpoint for LangGraph invoke.
-
-    Args:
-        request: The chat request
-        req: The FastAPI request object for connection state checking
-
-    Returns:
-        The streamed response
-    """
-    try:
-        # Convert Pydantic models to dictionaries and normalize content format
-        messages = []
-        for msg in request.messages:
-            message_dict = {"role": msg.role}
-
-            # Handle both string content and list of content items
-            if isinstance(msg.content, str):
-                message_dict["content"] = msg.content
-            else:
-                # For content as a list, convert to the format expected by the workflow
-                content_items = []
-                for item in msg.content:
-                    if item.type == "text" and item.text:
-                        content_items.append({"type": "text", "text": item.text})
-                    elif item.type == "image" and item.image_url:
-                        content_items.append(
-                            {"type": "image", "image_url": item.image_url}
-                        )
-
-                message_dict["content"] = content_items
-
-            messages.append(message_dict)
-
-        async def event_generator():
-            try:
-                async for event in run_agent_workflow(
-                    messages,
-                    request.debug,
-                    request.deep_thinking_mode,
-                    request.search_before_planning,
-                ):
-                    # Check if client is still connected
-                    if await req.is_disconnected():
-                        logger.info("Client disconnected, stopping workflow")
-                        break
-                    yield {
-                        "event": event["event"],
-                        "data": json.dumps(event["data"], ensure_ascii=False),
-                    }
-            except asyncio.CancelledError:
-                logger.info("Stream processing cancelled")
-                raise
-
-        return EventSourceResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            sep="\n",
-        )
-    except Exception as e:
-        logger.error(f"Error in chat endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))

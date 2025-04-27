@@ -155,12 +155,20 @@ def coordinator_node(state: State) -> Command[Literal["planner", "__end__"]]:
     logger.debug(f"Current state messages: {state['messages']}")
     logger.debug(f"reporter response: {response}")
 
-    goto = "__end__"
     if "handoff_to_planner" in response.content:
-        goto = "planner"
+        return Command(goto="planner")
 
+    # otherwise it's a greeting / small-talk reply we want to show
     return Command(
-        goto=goto,
+        update={
+            "messages": [                     # <-- this makes the patch visible
+                HumanMessage(
+                    content=response.content,
+                    name="coordinator"
+                )
+            ]
+        },
+        goto="__end__",                      
     )
 
 
